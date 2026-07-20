@@ -157,6 +157,10 @@ endif()
 install(FILES "${CMAKE_CURRENT_SOURCE_DIR}/store/async_store.py"
         DESTINATION ${PYTHON_SYS_PATH}/${PYTHON_PACKAGE_NAME})
 
+install(
+  FILES "${CMAKE_CURRENT_SOURCE_DIR}/../mooncake-wheel/mooncake/kv_tiering.py"
+  DESTINATION ${PYTHON_SYS_PATH}/${PYTHON_PACKAGE_NAME})
+
 # Install Python scripts from mooncake - wheel / mooncake / directory
 install(
   FILES
