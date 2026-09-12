@@ -54,6 +54,12 @@ func (h *KVEventHandler) HandleEvent(event zmq.KVEvent, dpRank int64) error {
 		)
 		slog.Info("Received BlockRemovedEvent", "medium", e.Medium)
 		return h.handleBlockRemoved(ctx, e, dpRank)
+	case *zmq.AllBlocksClearedEvent:
+		slog.Warn("Received AllBlocksClearedEvent; clearing the instance index conservatively",
+			"instance_id", h.instanceID,
+			"dpRank", dpRank,
+		)
+		return h.handleAllBlocksCleared(e)
 
 	default:
 		slog.Warn("Unknown event type",
@@ -66,8 +72,8 @@ func (h *KVEventHandler) HandleEvent(event zmq.KVEvent, dpRank int64) error {
 func (h *KVEventHandler) handleBlockStored(ctx context.Context, event *zmq.BlockStoredEvent, dpRank int64) error {
 	if event.BlockSize != h.blockSize {
 		slog.Warn("handleBlockStored: Block size mismatch, the event will be discarded.",
-				  "expected", h.blockSize,
-				  "actual", event.BlockSize)
+			"expected", h.blockSize,
+			"actual", event.BlockSize)
 		return nil
 	}
 	// Convert to kvindexer event
@@ -76,6 +82,8 @@ func (h *KVEventHandler) handleBlockStored(ctx context.Context, event *zmq.Block
 		BlockSize:       event.BlockSize,
 		ModelName:       h.modelName,
 		LoraName:        h.loraName,
+		TenantID:        h.tenant_id,
+		AdditionalSalt:  h.additionalSalt,
 		InstanceID:      h.instanceID,
 		ParentBlockHash: event.ParentBlockHash,
 		TokenIds:        event.TokenIDs,
@@ -87,6 +95,7 @@ func (h *KVEventHandler) handleBlockStored(ctx context.Context, event *zmq.Block
 	// TODO support mooncake_key map
 	if er != nil {
 		slog.Error("process store event failed.", "error", er)
+		return er
 	}
 
 	slog.Debug("in handleBlockStored", "conductorEvent", conductorEvent)
@@ -97,19 +106,39 @@ func (h *KVEventHandler) handleBlockStored(ctx context.Context, event *zmq.Block
 func (h *KVEventHandler) handleBlockRemoved(ctx context.Context, event *zmq.BlockRemovedEvent, dpRank int64) error {
 	// Convert to conductor event
 	conductorEvent := common.RemovedEvent{
-		BlockHashes: event.BlockHashes,
-		ModelName:   h.modelName,
-		LoraName:    h.loraName,
-		InstanceID:  h.instanceID,
-		BlockSize:   h.blockSize,
+		BlockHashes:    event.BlockHashes,
+		ModelName:      h.modelName,
+		LoraName:       h.loraName,
+		TenantID:       h.tenant_id,
+		AdditionalSalt: h.additionalSalt,
+		InstanceID:     h.instanceID,
+		BlockSize:      h.blockSize,
 	}
 	indexer := h.manager.getIndexer()
 	er := indexer.ProcessRemoveEvent(conductorEvent, dpRank, h.instanceID)
 	if er != nil {
-		slog.Error("process store event failed.")
+		slog.Error("process remove event failed.", "error", er)
+		return er
 	}
 	slog.Debug("in handleBlockRemoved", "conductorEvent", conductorEvent)
 
+	return nil
+}
+
+// handleAllBlocksCleared removes every prefix for the affected instance. The
+// event itself is rank-scoped in SGLang, while the current PrefixCacheTable
+// stores one shared mapping per instance; clearing the entire instance trades
+// temporary cache misses for the safety property that no stale cache location
+// is returned.
+func (h *KVEventHandler) handleAllBlocksCleared(event *zmq.AllBlocksClearedEvent) error {
+	h.manager.getIndexer().ClearInstance(
+		h.modelName,
+		h.loraName,
+		h.tenant_id,
+		h.additionalSalt,
+		h.blockSize,
+		h.instanceID,
+	)
 	return nil
 }
 

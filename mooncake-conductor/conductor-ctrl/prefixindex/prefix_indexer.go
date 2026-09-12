@@ -245,7 +245,10 @@ func (p *PrefixCacheTable) ProcessStoreEvent(event common.StoredEvent, dpRank in
 	if len(event.BlockHashes) == 0 {
 		return nil
 	}
-	tenantID := "default"
+	tenantID := event.TenantID
+	if tenantID == "" {
+		tenantID = "default"
+	}
 
 	slog.Debug("In ProcessStoreEvent", "modelName", event.ModelName, "instanceID", event.InstanceID, "dpRank", dpRank)
 	contextData := p.getContextData(&ModelContext{
@@ -253,7 +256,7 @@ func (p *PrefixCacheTable) ProcessStoreEvent(event common.StoredEvent, dpRank in
 		LoraName:       event.LoraName,
 		BlockSize:      event.BlockSize,
 		TenantID:       tenantID,
-		AdditionalSalt: "",
+		AdditionalSalt: event.AdditionalSalt,
 		InstanceID:     event.InstanceID,
 	})
 
@@ -325,14 +328,18 @@ func (p *PrefixCacheTable) ProcessRemoveEvent(event common.RemovedEvent, dpRank 
 	if len(event.BlockHashes) == 0 {
 		return nil
 	}
+	tenantID := event.TenantID
+	if tenantID == "" {
+		tenantID = "default"
+	}
 	// TODO @yejj710  Debug remove_event
 
 	contextData := p.getContextData(&ModelContext{
 		ModelName:      event.ModelName,
 		LoraName:       event.LoraName,
 		BlockSize:      event.BlockSize,
-		TenantID:       "default",
-		AdditionalSalt: "",
+		TenantID:       tenantID,
+		AdditionalSalt: event.AdditionalSalt,
 		InstanceID:     instanceID,
 	})
 
@@ -373,6 +380,27 @@ func (p *PrefixCacheTable) ProcessRemoveEvent(event common.RemovedEvent, dpRank 
 	}
 
 	return nil
+}
+
+// ClearInstance invalidates all indexed prefixes for a service instance. It is
+// used when an engine emits AllBlocksCleared and makes stale cache hits
+// impossible while the index lacks per-instance/per-DP replica bookkeeping.
+func (p *PrefixCacheTable) ClearInstance(modelName, loraName, tenantID, additionalSalt string, blockSize int64, instanceID string) {
+	if tenantID == "" {
+		tenantID = "default"
+	}
+	contextKey := ModelContext{
+		ModelName:      modelName,
+		LoraName:       loraName,
+		BlockSize:      blockSize,
+		TenantID:       tenantID,
+		AdditionalSalt: additionalSalt,
+		InstanceID:     instanceID,
+	}
+	if _, loaded := p.contextMap.LoadAndDelete(contextKey); loaded {
+		p.contextCount.Add(-1)
+		slog.Info("Cleared prefix cache index for instance", "instance_id", instanceID)
+	}
 }
 
 func (p *PrefixCacheTable) computeHash(parentHash uint64, blockTokenIDs []int32) uint64 {

@@ -3,12 +3,13 @@ package common
 const (
 	ServiceTypeVLLM     string = "vLLM"
 	ServiceTypeMooncake string = "Mooncake"
+	ServiceTypeSGLang   string = "SGLang"
 )
 
 type ServiceConfig struct {
 	Endpoint       string // kv publisher endpoint
 	ReplayEndpoint string // replay publisher endpoint
-	Type           string // kv publisher type, support: vLLM,Mooncake
+	Type           string // kv publisher type, support: vLLM, Mooncake, SGLang
 	ModelName      string // Model name hosted by the service
 	LoraName       string
 	TenantID       string // (optional), default use 'default'
@@ -23,6 +24,8 @@ type StoredEvent struct {
 	BlockSize       int64
 	ModelName       string
 	LoraName        string
+	TenantID        string
+	AdditionalSalt  string
 	InstanceID      string
 	ParentBlockHash uint64
 	TokenIds        []int32
@@ -30,10 +33,12 @@ type StoredEvent struct {
 }
 
 type RemovedEvent struct {
-	BlockHashes []uint64
-	ModelName   string
-	LoraName    string
-	InstanceID  string
-	BlockSize   int64
-	Medium      string
+	BlockHashes    []uint64
+	ModelName      string
+	LoraName       string
+	TenantID       string
+	AdditionalSalt string
+	InstanceID     string
+	BlockSize      int64
+	Medium         string
 }

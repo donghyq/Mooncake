@@ -31,7 +31,7 @@ func NewMockEventHandler() *MockEventHandler {
 	}
 }
 
-func (m *MockEventHandler) HandleEvent(event zmq.KVEvent) error {
+func (m *MockEventHandler) HandleEvent(event zmq.KVEvent, _ int64) error {
 	m.mu.Lock()
 	defer m.mu.Unlock()
 
@@ -74,10 +74,17 @@ type MockPublisher struct {
 	pubSocket    *zmq4.Socket
 	routerSocket *zmq4.Socket
 	sequence     int64
+	replayBuffer []replayEntry
 	mu           sync.Mutex
 	ctx          context.Context
 	cancel       context.CancelFunc
 	wg           sync.WaitGroup
+}
+
+type replayEntry struct {
+	sequence int64
+	topic    string
+	payload  []byte
 }
 
 func createMockPublisher(t *testing.T, pubPort, routerPort int) *MockPublisher {
@@ -146,6 +153,8 @@ func (mp *MockPublisher) PublishEvent(topic string, event zmq.KVEvent) error {
 
 	if topic == "mooncake" {
 		payload, err = encodeMooncakeEvent(event)
+	} else if topic == zmq.SourceSGLang {
+		payload, err = encodeSGLangEvent(event)
 	} else {
 		payload, err = encodeVllmEvent(event)
 	}
@@ -156,6 +165,7 @@ func (mp *MockPublisher) PublishEvent(topic string, event zmq.KVEvent) error {
 	mp.mu.Lock()
 	mp.sequence++
 	seq := mp.sequence
+	mp.replayBuffer = append(mp.replayBuffer, replayEntry{sequence: seq, topic: topic, payload: payload})
 	mp.mu.Unlock()
 
 	seqBytes := make([]byte, 8)
@@ -163,6 +173,18 @@ func (mp *MockPublisher) PublishEvent(topic string, event zmq.KVEvent) error {
 
 	_, err = mp.pubSocket.SendMessage(topic, seqBytes, payload)
 	return err
+}
+
+func (mp *MockPublisher) PublishBuffered(sequence int64) error {
+	mp.mu.Lock()
+	defer mp.mu.Unlock()
+	for _, entry := range mp.replayBuffer {
+		if entry.sequence == sequence {
+			_, err := mp.pubSocket.SendMessage(entry.topic, sequenceBytes(entry.sequence), entry.payload)
+			return err
+		}
+	}
+	return errors.New("replay entry not found")
 }
 
 func (mp *MockPublisher) handleReplay() {
@@ -177,16 +199,30 @@ func (mp *MockPublisher) handleReplay() {
 		// Set receive timeout
 		_ = mp.routerSocket.SetRcvtimeo(100 * time.Millisecond)
 
-		msg, err := mp.routerSocket.RecvBytes(0)
+		frames, err := mp.routerSocket.RecvMessageBytes(0)
 		if err != nil {
 			continue
 		}
-
-		if len(msg) == 8 {
-			// Send ACK
-			_, _ = mp.routerSocket.SendBytes([]byte("OK"), 0)
+		if len(frames) != 3 || len(frames[2]) != 8 {
+			continue
 		}
+		fromSeq := int64(binary.BigEndian.Uint64(frames[2]))
+		mp.mu.Lock()
+		entries := append([]replayEntry(nil), mp.replayBuffer...)
+		mp.mu.Unlock()
+		for _, entry := range entries {
+			if entry.sequence >= fromSeq {
+				_, _ = mp.routerSocket.SendMessage(frames[0], []byte{}, sequenceBytes(entry.sequence), entry.payload)
+			}
+		}
+		_, _ = mp.routerSocket.SendMessage(frames[0], []byte{}, sequenceBytes(-1), []byte{})
 	}
+}
+
+func sequenceBytes(sequence int64) []byte {
+	data := make([]byte, 8)
+	binary.BigEndian.PutUint64(data, uint64(sequence))
+	return data
 }
 
 func (mp *MockPublisher) Close() {
@@ -243,6 +279,25 @@ func encodeVllmEvent(event zmq.KVEvent) ([]byte, error) {
 	}
 }
 
+func encodeSGLangEvent(event zmq.KVEvent) ([]byte, error) {
+	switch e := event.(type) {
+	case *zmq.BlockStoredEvent:
+		eventData := []interface{}{
+			"BlockStored",
+			convertUint64Slice(e.BlockHashes),
+			e.ParentBlockHash,
+			convertInt32Slice(e.TokenIDs),
+			e.BlockSize,
+			e.LoraID,
+			e.Medium,
+		}
+		batch := []interface{}{e.Timestamp.Unix(), []interface{}{eventData}, int64(0)}
+		return msgpack.Marshal(batch)
+	default:
+		return nil, errors.New("unsupported event type for SGLang")
+	}
+}
+
 func convertUint64Slice(slice []uint64) []interface{} {
 	result := make([]interface{}, len(slice))
 	for i, v := range slice {
@@ -283,15 +338,11 @@ func TestZMQClient_Connect_Success(t *testing.T) {
 		t.Fatalf("Failed to get ROUTER endpoint: %v", err)
 	}
 
-	pubPort := extractPortFromEndpoint(pubEndpoint)
-	routerPort := extractPortFromEndpoint(routerEndpoint)
-
 	config := &zmq.ZMQClientConfig{
 		CachePoolKey:   "test-pod",
-		ServiceIP:      "127.0.0.1",
+		Endpoint:       pubEndpoint,
 		ModelName:      "test-model",
-		Port:           pubPort,
-		RouterPort:     routerPort,
+		ReplayEndpoint: routerEndpoint,
 		PollTimeout:    100 * time.Millisecond,
 		ReplayTimeout:  1 * time.Second,
 		ReconnectDelay: 100 * time.Millisecond,
@@ -317,15 +368,11 @@ func TestZMQClient_Connect_AlreadyConnected(t *testing.T) {
 	pubEndpoint, _ := publisher.pubSocket.GetLastEndpoint()
 	routerEndpoint, _ := publisher.routerSocket.GetLastEndpoint()
 
-	pubPort := extractPortFromEndpoint(pubEndpoint)
-	routerPort := extractPortFromEndpoint(routerEndpoint)
-
 	config := &zmq.ZMQClientConfig{
 		CachePoolKey:   "test-pod",
-		ServiceIP:      "127.0.0.1",
+		Endpoint:       pubEndpoint,
 		ModelName:      "test-model",
-		Port:           pubPort,
-		RouterPort:     routerPort,
+		ReplayEndpoint: routerEndpoint,
 		PollTimeout:    100 * time.Millisecond,
 		ReplayTimeout:  1 * time.Second,
 		ReconnectDelay: 100 * time.Millisecond,
@@ -357,15 +404,11 @@ func TestZMQClient_Start_Stop(t *testing.T) {
 	pubEndpoint, _ := publisher.pubSocket.GetLastEndpoint()
 	routerEndpoint, _ := publisher.routerSocket.GetLastEndpoint()
 
-	pubPort := extractPortFromEndpoint(pubEndpoint)
-	routerPort := extractPortFromEndpoint(routerEndpoint)
-
 	config := &zmq.ZMQClientConfig{
 		CachePoolKey:   "test-pod",
-		ServiceIP:      "127.0.0.1",
+		Endpoint:       pubEndpoint,
+		ReplayEndpoint: routerEndpoint,
 		ModelName:      "test-model",
-		Port:           pubPort,
-		RouterPort:     routerPort,
 		PollTimeout:    100 * time.Millisecond,
 		ReplayTimeout:  1 * time.Second,
 		ReconnectDelay: 100 * time.Millisecond,
@@ -395,15 +438,11 @@ func TestZMQClient_ProcessMessage_MooncakeTopic(t *testing.T) {
 	pubEndpoint, _ := publisher.pubSocket.GetLastEndpoint()
 	routerEndpoint, _ := publisher.routerSocket.GetLastEndpoint()
 
-	pubPort := extractPortFromEndpoint(pubEndpoint)
-	routerPort := extractPortFromEndpoint(routerEndpoint)
-
 	config := &zmq.ZMQClientConfig{
 		CachePoolKey:   "test-pod",
-		ServiceIP:      "127.0.0.1",
+		Endpoint:       pubEndpoint,
+		ReplayEndpoint: routerEndpoint,
 		ModelName:      "test-model",
-		Port:           pubPort,
-		RouterPort:     routerPort,
 		PollTimeout:    100 * time.Millisecond,
 		ReplayTimeout:  1 * time.Second,
 		ReconnectDelay: 100 * time.Millisecond,
@@ -471,15 +510,11 @@ func TestZMQClient_ProcessMessage_VllmTopic(t *testing.T) {
 	pubEndpoint, _ := publisher.pubSocket.GetLastEndpoint()
 	routerEndpoint, _ := publisher.routerSocket.GetLastEndpoint()
 
-	pubPort := extractPortFromEndpoint(pubEndpoint)
-	routerPort := extractPortFromEndpoint(routerEndpoint)
-
 	config := &zmq.ZMQClientConfig{
 		CachePoolKey:   "test-pod",
-		ServiceIP:      "127.0.0.1",
+		Endpoint:       pubEndpoint,
+		ReplayEndpoint: routerEndpoint,
 		ModelName:      "test-model",
-		Port:           pubPort,
-		RouterPort:     routerPort,
 		PollTimeout:    100 * time.Millisecond,
 		ReplayTimeout:  1 * time.Second,
 		ReconnectDelay: 100 * time.Millisecond,
@@ -532,6 +567,116 @@ func TestZMQClient_ProcessMessage_VllmTopic(t *testing.T) {
 	}
 }
 
+func TestZMQClient_ProcessMessage_SGLangTopic(t *testing.T) {
+	skipIfZMQUnavailable(t)
+
+	publisher := createMockPublisher(t, 5557, 5558)
+	defer publisher.Close()
+
+	pubEndpoint, _ := publisher.pubSocket.GetLastEndpoint()
+	routerEndpoint, _ := publisher.routerSocket.GetLastEndpoint()
+
+	config := &zmq.ZMQClientConfig{
+		CachePoolKey:   "test-pod",
+		Endpoint:       pubEndpoint,
+		ReplayEndpoint: routerEndpoint,
+		ModelName:      "test-model",
+		PollTimeout:    100 * time.Millisecond,
+		ReplayTimeout:  1 * time.Second,
+		ReconnectDelay: 100 * time.Millisecond,
+	}
+
+	handler := NewMockEventHandler()
+	client := zmq.NewZMQClient(config, handler)
+	if err := client.Start(); err != nil {
+		t.Fatalf("Start failed: %v", err)
+	}
+	defer client.Stop()
+
+	time.Sleep(100 * time.Millisecond)
+	event := &zmq.BlockStoredEvent{
+		Type:            zmq.EventTypeBlockStored,
+		Timestamp:       time.Now().UTC(),
+		BlockHashes:     []uint64{500},
+		ParentBlockHash: 400,
+		TokenIDs:        []int32{7, 8, 9},
+		BlockSize:       3,
+		LoraID:          11,
+		Medium:          "GPU",
+	}
+	if err := publisher.PublishEvent(zmq.SourceSGLang, event); err != nil {
+		t.Fatalf("PublishEvent failed: %v", err)
+	}
+
+	time.Sleep(200 * time.Millisecond)
+	events := handler.GetEvents()
+	if len(events) != 1 {
+		t.Fatalf("expected 1 event, got %d", len(events))
+	}
+	stored, ok := events[0].(*zmq.BlockStoredEvent)
+	if !ok {
+		t.Fatalf("expected BlockStoredEvent, got %T", events[0])
+	}
+	if stored.PodName != "test-pod" || stored.ParentBlockHash != 400 || stored.LoraID != 11 || stored.Medium != "GPU" {
+		t.Errorf("unexpected decoded SGLang event: %+v", stored)
+	}
+}
+
+func TestZMQClient_SGLangReplay_ReplaysAndDeduplicates(t *testing.T) {
+	skipIfZMQUnavailable(t)
+
+	publisher := createMockPublisher(t, 5557, 5558)
+	defer publisher.Close()
+	pubEndpoint, _ := publisher.pubSocket.GetLastEndpoint()
+	routerEndpoint, _ := publisher.routerSocket.GetLastEndpoint()
+
+	event := &zmq.BlockStoredEvent{
+		Type:            zmq.EventTypeBlockStored,
+		Timestamp:       time.Now().UTC(),
+		BlockHashes:     []uint64{900},
+		ParentBlockHash: 0,
+		TokenIDs:        []int32{1, 2, 3, 4},
+		BlockSize:       4,
+		Medium:          "GPU",
+	}
+	if err := publisher.PublishEvent(zmq.SourceSGLang, event); err != nil {
+		t.Fatalf("PublishEvent failed: %v", err)
+	}
+	// Let the PUB socket complete its slow-joiner window before creating the client.
+	time.Sleep(100 * time.Millisecond)
+
+	handler := NewMockEventHandler()
+	client := zmq.NewZMQClient(&zmq.ZMQClientConfig{
+		CachePoolKey:   "test-pod",
+		Endpoint:       pubEndpoint,
+		ReplayEndpoint: routerEndpoint,
+		Source:         zmq.SourceSGLang,
+		PollTimeout:    100 * time.Millisecond,
+		ReplayTimeout:  time.Second,
+		ReconnectDelay: 100 * time.Millisecond,
+	}, handler)
+	if err := client.Start(); err != nil {
+		t.Fatalf("Start failed: %v", err)
+	}
+	deadline := time.Now().Add(2 * time.Second)
+	for handler.GetCallCount() != 1 && time.Now().Before(deadline) {
+		time.Sleep(10 * time.Millisecond)
+	}
+	if got := handler.GetCallCount(); got != 1 {
+		t.Fatalf("expected replay to dispatch one event, got %d", got)
+	}
+	if err := publisher.PublishBuffered(1); err != nil {
+		t.Fatalf("PublishBuffered failed: %v", err)
+	}
+	time.Sleep(200 * time.Millisecond)
+	// The sequence already received through replay must not be processed again
+	// when it also arrives through the regular PUB/SUB channel.
+	if got := handler.GetCallCount(); got != 1 {
+		t.Fatalf("expected duplicate sequence to be skipped, got %d calls", got)
+	}
+	client.Stop()
+}
+
 func TestZMQClient_SequenceTracking(t *testing.T) {
 	skipIfZMQUnavailable(t)
 
@@ -541,15 +686,11 @@ func TestZMQClient_SequenceTracking(t *testing.T) {
 	pubEndpoint, _ := publisher.pubSocket.GetLastEndpoint()
 	routerEndpoint, _ := publisher.routerSocket.GetLastEndpoint()
 
-	pubPort := extractPortFromEndpoint(pubEndpoint)
-	routerPort := extractPortFromEndpoint(routerEndpoint)
-
 	config := &zmq.ZMQClientConfig{
 		CachePoolKey:   "test-pod",
-		ServiceIP:      "127.0.0.1",
+		Endpoint:       pubEndpoint,
+		ReplayEndpoint: routerEndpoint,
 		ModelName:      "test-model",
-		Port:           pubPort,
-		RouterPort:     routerPort,
 		PollTimeout:    100 * time.Millisecond,
 		ReplayTimeout:  1 * time.Second,
 		ReconnectDelay: 100 * time.Millisecond,
@@ -601,15 +742,11 @@ func TestZMQClient_ProcessMessage_EventGap(t *testing.T) {
 	pubEndpoint, _ := publisher.pubSocket.GetLastEndpoint()
 	routerEndpoint, _ := publisher.routerSocket.GetLastEndpoint()
 
-	pubPort := extractPortFromEndpoint(pubEndpoint)
-	routerPort := extractPortFromEndpoint(routerEndpoint)
-
 	config := &zmq.ZMQClientConfig{
 		CachePoolKey:   "test-pod",
-		ServiceIP:      "127.0.0.1",
+		Endpoint:       pubEndpoint,
+		ReplayEndpoint: routerEndpoint,
 		ModelName:      "test-model",
-		Port:           pubPort,
-		RouterPort:     routerPort,
 		PollTimeout:    100 * time.Millisecond,
 		ReplayTimeout:  1 * time.Second,
 		ReconnectDelay: 100 * time.Millisecond,

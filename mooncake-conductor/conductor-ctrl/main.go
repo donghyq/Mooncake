@@ -50,6 +50,8 @@ func mapServiceType(s string) (string, bool) {
 		return common.ServiceTypeVLLM, true
 	case "Mooncake":
 		return common.ServiceTypeMooncake, true
+	case "SGLang":
+		return common.ServiceTypeSGLang, true
 	default:
 		return "None", false
 	}

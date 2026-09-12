@@ -6,6 +6,7 @@ import (
 	"time"
 
 	"conductor/common"
+	"conductor/prefixindex"
 	"conductor/zmq"
 )
 
@@ -85,15 +86,88 @@ func TestHandleEvent_BlockStored_SizeMismatch_ReturnsNil(t *testing.T) {
 	}
 
 	event := &zmq.BlockStoredEvent{
-		BlockSize:         128, // mismatch
-		BlockHashes:       []uint64{100},
-		TokenIDs:          []int32{1, 2, 3, 4},
-		Timestamp:         time.Now(),
+		BlockSize:   128, // mismatch
+		BlockHashes: []uint64{100},
+		TokenIDs:    []int32{1, 2, 3, 4},
+		Timestamp:   time.Now(),
 	}
 
 	// HandleEvent should handle BlockStoredEvent dispatch and return nil on BlockSize mismatch
 	err := handler.HandleEvent(event, 0)
 	if err != nil {
 		t.Errorf("HandleEvent with mismatched BlockSize should return nil, got %v", err)
+	}
+}
+
+func TestHandleAllBlocksCleared_InvalidatesInstanceIndex(t *testing.T) {
+	m := NewEventManager([]common.ServiceConfig{}, 0)
+	handler := &KVEventHandler{
+		manager:    m,
+		blockSize:  4,
+		modelName:  "test-model",
+		loraName:   "",
+		instanceID: "test-instance",
+	}
+
+	stored := &zmq.BlockStoredEvent{
+		BlockSize:   4,
+		BlockHashes: []uint64{100},
+		TokenIDs:    []int32{1, 2, 3, 4},
+		Medium:      "GPU",
+	}
+	if err := handler.HandleEvent(stored, 0); err != nil {
+		t.Fatalf("store event: %v", err)
+	}
+	if got := len(m.getIndexer().GetGlobalView().ModelContexts); got != 1 {
+		t.Fatalf("expected populated index, got %d contexts", got)
+	}
+
+	if err := handler.HandleEvent(&zmq.AllBlocksClearedEvent{}, 0); err != nil {
+		t.Fatalf("all-cleared event: %v", err)
+	}
+	if got := len(m.getIndexer().GetGlobalView().ModelContexts); got != 0 {
+		t.Errorf("expected cleared index, got %d contexts", got)
+	}
+}
+
+func TestHandleAllBlocksCleared_UsesServiceTenantAndSalt(t *testing.T) {
+	m := NewEventManager([]common.ServiceConfig{}, 0)
+	handler := &KVEventHandler{
+		manager:        m,
+		blockSize:      4,
+		modelName:      "test-model",
+		loraName:       "",
+		tenant_id:      "tenant-a",
+		additionalSalt: "isolated-cache",
+		instanceID:     "test-instance",
+	}
+
+	stored := &zmq.BlockStoredEvent{
+		BlockSize:   4,
+		BlockHashes: []uint64{100},
+		TokenIDs:    []int32{1, 2, 3, 4},
+		Medium:      "GPU",
+	}
+	if err := handler.HandleEvent(stored, 0); err != nil {
+		t.Fatalf("store event: %v", err)
+	}
+
+	context := &prefixindex.ModelContext{
+		TenantID:       "tenant-a",
+		ModelName:      "test-model",
+		LoraName:       "",
+		BlockSize:      4,
+		AdditionalSalt: "isolated-cache",
+		InstanceID:     "test-instance",
+	}
+	if result := m.getIndexer().CacheHitCompute(context, []int32{1, 2, 3, 4}); result.LongestMatchTokens != 4 {
+		t.Fatalf("cache hit with service tenant and salt = %d, want 4", result.LongestMatchTokens)
+	}
+
+	if err := handler.HandleEvent(&zmq.AllBlocksClearedEvent{}, 0); err != nil {
+		t.Fatalf("all-cleared event: %v", err)
+	}
+	if result := m.getIndexer().CacheHitCompute(context, []int32{1, 2, 3, 4}); result.LongestMatchTokens != 0 {
+		t.Errorf("cache hit after clear = %d, want 0", result.LongestMatchTokens)
 	}
 }

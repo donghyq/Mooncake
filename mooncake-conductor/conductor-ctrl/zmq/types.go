@@ -15,6 +15,9 @@ type ZMQClientConfig struct {
 	CachePoolKey   string
 	Endpoint       string
 	ReplayEndpoint string
+	// Source selects the decoder for replay payloads, whose ROUTER protocol
+	// does not include the PUB/SUB topic frame.
+	Source         string
 	ModelName      string
 	PollTimeout    time.Duration
 	ReplayTimeout  time.Duration

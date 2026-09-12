@@ -16,6 +16,10 @@ type EventParser interface {
 	Source() string
 }
 
+type batchDecoderOptions struct {
+	dataParallelRank func([]interface{}) (int64, error)
+}
+
 type mooncakeParser struct{}
 
 func (p *mooncakeParser) Source() string { return SourceMooncake }
@@ -52,6 +56,7 @@ func decodeCommonEventBatch(
 	expectedLength int,
 	extractEvents func([]interface{}) ([]interface{}, interface{}, error),
 	parser EventParser,
+	options batchDecoderOptions,
 ) (*EventBatch, error) {
 
 	if len(data) > 0 {
@@ -76,9 +81,9 @@ func decodeCommonEventBatch(
 		slog.Warn("Received empty event list")
 	}
 
-	var dpRank int64 = -1
-	if expectedLength == 3 {
-		dpRank, err = parseInt64(arr[2])
+	dpRank := int64(-1)
+	if options.dataParallelRank != nil {
+		dpRank, err = options.dataParallelRank(arr)
 		if err != nil {
 			return nil, fmt.Errorf("failed to parse dpRank: %w", err)
 		}
@@ -122,6 +127,7 @@ func DecodeMooncakeEventBatch(data []byte) (*EventBatch, error) {
 			return events, arr[0], nil
 		},
 		newMooncakeParser(),
+		batchDecoderOptions{},
 	)
 }
 
@@ -174,7 +180,164 @@ func DecodeVllmEventBatch(data []byte) (*EventBatch, error) {
 			return events, arr[0], nil
 		},
 		newVLLMParser(),
+		batchDecoderOptions{},
 	)
+}
+
+// sglangParser decodes the tagged msgspec structs emitted by SGLang.
+type sglangParser struct{}
+
+func (p *sglangParser) Source() string { return SourceSGLang }
+
+func (p *sglangParser) EventMappings() map[string]EventType {
+	return map[string]EventType{
+		"BlockStored":      EventTypeBlockStored,
+		"BlockRemoved":     EventTypeBlockRemoved,
+		"AllBlocksCleared": EventTypeAllCleared,
+	}
+}
+
+func (p *sglangParser) ParseEvent(raw []interface{}, timestamp interface{}) (KVEvent, error) {
+	if len(raw) == 0 {
+		return nil, fmt.Errorf("empty SGLang event")
+	}
+
+	eventTypeStr, ok := raw[0].(string)
+	if !ok {
+		return nil, fmt.Errorf("invalid SGLang event type format: %T", raw[0])
+	}
+
+	switch p.EventMappings()[eventTypeStr] {
+	case EventTypeBlockStored:
+		return parseSGLangBlockStored(raw, timestamp)
+	case EventTypeBlockRemoved:
+		return parseSGLangBlockRemoved(raw, timestamp)
+	case EventTypeAllCleared:
+		return parseSGLangAllCleared(raw, timestamp)
+	default:
+		return nil, fmt.Errorf("unknown SGLang event type: %s", eventTypeStr)
+	}
+}
+
+func DecodeSGLangEventBatch(data []byte) (*EventBatch, error) {
+	return decodeCommonEventBatch(
+		data,
+		3,
+		func(arr []interface{}) ([]interface{}, interface{}, error) {
+			events, ok := arr[1].([]interface{})
+			if !ok {
+				return nil, nil, fmt.Errorf("invalid SGLang events type: %T", arr[1])
+			}
+			return events, arr[0], nil
+		},
+		&sglangParser{},
+		batchDecoderOptions{
+			dataParallelRank: func(arr []interface{}) (int64, error) {
+				return parseInt64(arr[2])
+			},
+		},
+	)
+}
+
+// parseSGLangBlockStored parses the msgspec array-like representation:
+//
+//	["BlockStored", hashes, parent_hash, token_ids, block_size, lora_id, medium]
+//
+// SGLang uses msgspec Struct(array_like=True, omit_defaults=True). The
+// optional lora_id and medium fields can therefore be absent independently.
+// Its cache-event mixin defaults an omitted medium to GPU, so preserve that
+// meaning when the wire payload has no medium value (including the explicit
+// nil placeholders emitted by the current msgspec version). A six-element
+// payload is ambiguous: data[5] is either lora_id or medium; distinguish them
+// by type.
+func parseSGLangBlockStored(data []interface{}, timestamp interface{}) (*BlockStoredEvent, error) {
+	if len(data) < 5 || len(data) > 7 {
+		return nil, fmt.Errorf("SGLang BlockStored: expected 5 to 7 fields, got %d", len(data))
+	}
+
+	event := &BlockStoredEvent{Type: EventTypeBlockStored}
+	var err error
+	if event.Timestamp, err = parseTimestamp(timestamp); err != nil {
+		return nil, fmt.Errorf("parse SGLang timestamp: %w", err)
+	}
+	if event.BlockHashes, err = parseUint64Array(data[1]); err != nil {
+		return nil, fmt.Errorf("parse SGLang block_hashes: %w", err)
+	}
+
+	if data[2] != nil {
+		if event.ParentBlockHash, err = parseUint64(data[2]); err != nil {
+			return nil, fmt.Errorf("parse SGLang parent_block_hash: %w", err)
+		}
+	}
+	if event.TokenIDs, err = parseInt32Array(data[3]); err != nil {
+		return nil, fmt.Errorf("parse SGLang token_ids: %w", err)
+	}
+	if event.BlockSize, err = parseInt64(data[4]); err != nil {
+		return nil, fmt.Errorf("parse SGLang block_size: %w", err)
+	}
+	event.Medium = "GPU"
+	if len(data) == 7 {
+		if data[5] != nil {
+			if event.LoraID, err = parseInt64(data[5]); err != nil {
+				return nil, fmt.Errorf("parse SGLang lora_id: %w", err)
+			}
+		}
+		if data[6] != nil {
+			if event.Medium, err = safeGetString(data[6]); err != nil {
+				return nil, fmt.Errorf("parse SGLang medium: %w", err)
+			}
+		}
+	} else if len(data) == 6 && data[5] != nil {
+		switch data[5].(type) {
+		case string, []byte, fmt.Stringer:
+			if event.Medium, err = safeGetString(data[5]); err != nil {
+				return nil, fmt.Errorf("parse SGLang medium: %w", err)
+			}
+		default:
+			if event.LoraID, err = parseInt64(data[5]); err != nil {
+				return nil, fmt.Errorf("parse SGLang lora_id: %w", err)
+			}
+		}
+	}
+
+	return event, nil
+}
+
+func parseSGLangBlockRemoved(data []interface{}, timestamp interface{}) (*BlockRemovedEvent, error) {
+	if len(data) != 3 {
+		return nil, fmt.Errorf("SGLang BlockRemoved: expected 3 fields, got %d", len(data))
+	}
+
+	event := &BlockRemovedEvent{Type: EventTypeBlockRemoved}
+	var err error
+	if event.Timestamp, err = parseTimestamp(timestamp); err != nil {
+		return nil, fmt.Errorf("parse SGLang timestamp: %w", err)
+	}
+	if event.BlockHashes, err = parseUint64Array(data[1]); err != nil {
+		return nil, fmt.Errorf("parse SGLang block_hashes: %w", err)
+	}
+	// SGLang emits GPU removals by default. A nil optional medium on the wire
+	// must therefore retain GPU semantics rather than becoming an untracked tier.
+	event.Medium = "GPU"
+	if data[2] != nil {
+		if event.Medium, err = safeGetString(data[2]); err != nil {
+			return nil, fmt.Errorf("parse SGLang medium: %w", err)
+		}
+	}
+	return event, nil
+}
+
+func parseSGLangAllCleared(data []interface{}, timestamp interface{}) (*AllBlocksClearedEvent, error) {
+	if len(data) != 1 {
+		return nil, fmt.Errorf("SGLang AllBlocksCleared: expected 1 field, got %d", len(data))
+	}
+
+	event := &AllBlocksClearedEvent{Type: EventTypeAllCleared}
+	var err error
+	if event.Timestamp, err = parseTimestamp(timestamp); err != nil {
+		return nil, fmt.Errorf("parse SGLang timestamp: %w", err)
+	}
+	return event, nil
 }
 
 func parseMooncakeBlockStored(data []interface{}, timestamp interface{}) (*BlockStoredEvent, error) {
@@ -232,6 +395,10 @@ func parseMooncakeBlockStored(data []interface{}, timestamp interface{}) (*Block
 
 // parseBlockStoredEvent parses a BlockStoredEvent from raw data
 func parseVllmBlockStored(data []interface{}, timestamp interface{}) (*BlockStoredEvent, error) {
+	if len(data) != 5 && len(data) != 7 {
+		return nil, fmt.Errorf("vLLM BlockStored: expected 5 or 7 fields, got %d", len(data))
+	}
+
 	event := &BlockStoredEvent{
 		Type: EventTypeBlockStored,
 	}
@@ -286,10 +453,12 @@ func parseVllmBlockStored(data []interface{}, timestamp interface{}) (*BlockStor
 		return nil, fmt.Errorf("failed to parse field at index 4 as 'block_size': %w", err)
 	}
 
-	if medium, err := safeGetString(data[6]); err == nil {
-		event.Medium = medium
-	} else {
-		return nil, fmt.Errorf("failed to parse 'medium' from field at index 6: %w", err)
+	if len(data) == 7 {
+		if medium, err := safeGetString(data[6]); err == nil {
+			event.Medium = medium
+		} else {
+			return nil, fmt.Errorf("failed to parse 'medium' from field at index 6: %w", err)
+		}
 	}
 
 	return event, nil

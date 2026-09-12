@@ -21,6 +21,7 @@ type ZMQClient struct {
 
 	// State management
 	mu             sync.RWMutex
+	processMu      sync.Mutex
 	connected      bool
 	lastSeq        int64
 	reconnectDelay time.Duration
@@ -49,9 +50,20 @@ func (c *ZMQClient) Start() error {
 	if err := c.Connect(); err != nil {
 		return fmt.Errorf("initial connection failed: %w", err)
 	}
-
 	c.wg.Add(1)
 	go c.loop()
+	// SGLang retains a bounded event buffer behind its replay ROUTER. Replay
+	// runs independently so a slow or temporarily unavailable replay service
+	// never prevents the HTTP control plane from starting.
+	if c.config.Source == SourceSGLang && c.config.ReplayEndpoint != "" {
+		c.wg.Add(1)
+		go func() {
+			defer c.wg.Done()
+			if err := c.requestReplay(1); err != nil {
+				slog.Warn("Initial SGLang replay failed", "service", c.config.CachePoolKey, "error", err)
+			}
+		}()
+	}
 
 	slog.Info("ZMQ client started", "service", c.config.CachePoolKey)
 	return nil
@@ -113,7 +125,7 @@ func (c *ZMQClient) handleReconnect() {
 
 	// Reconnected! Request replay from last known sequence
 	lastSeq := c.getLastSequence()
-	if lastSeq >= 0 {
+	if lastSeq >= 0 && c.config.ReplayEndpoint != "" {
 		slog.Info("Reconnected", "service", c.config.CachePoolKey, "resuming_from", lastSeq+1)
 		if err := c.requestReplay(lastSeq + 1); err != nil {
 			slog.Warn("Failed to request replay after reconnect", "service", c.config.CachePoolKey, "error", err)
@@ -180,7 +192,7 @@ func (c *ZMQClient) Connect() error {
 
 	c.reconnectDelay = c.config.ReconnectDelay
 
-	slog.Info("Successfully connected to vLLM publisher", "service", c.config.CachePoolKey, "endpoint", c.config.Endpoint)
+	slog.Info("Successfully connected to KV event publisher", "service", c.config.CachePoolKey, "endpoint", c.config.Endpoint)
 
 	return nil
 }
@@ -240,56 +252,62 @@ func (c *ZMQClient) processMessage(socket *zmq.Socket) error {
 	}
 	seq := int64(binary.BigEndian.Uint64(seqBytes))
 
+	return c.processPayload(seq, payload, string(topic))
+
+}
+
+// processPayload decodes and dispatches both PUB/SUB batches and replay
+// batches. Sequence de-duplication is deliberately shared: SGLang may replay
+// an event that was already delivered through PUB/SUB while reconnecting.
+func (c *ZMQClient) processPayload(seq int64, payload []byte, source string) error {
+	c.processMu.Lock()
+	defer c.processMu.Unlock()
+
 	c.mu.RLock()
 	lastSeq := c.lastSeq
 	c.mu.RUnlock()
-
+	if seq <= lastSeq {
+		slog.Debug("Skipping already processed KV event", "service", c.config.CachePoolKey, "seq", seq, "last", lastSeq)
+		return nil
+	}
 	if lastSeq != -1 && seq > lastSeq+1 {
-		slog.Warn("Event gap detected",
-			"service", c.config.CachePoolKey,
-			"missed", seq-lastSeq-1,
-			"last", lastSeq,
-			"current", seq,
-		)
-		// Trigger replay for missed events?
-		// Usually we just log warning here, or could auto-trigger requestReplay
+		slog.Warn("Event gap detected", "service", c.config.CachePoolKey, "missed", seq-lastSeq-1, "last", lastSeq, "current", seq)
 	}
 
-	// Update Sequence immediately to keep state fresh
-	c.mu.Lock()
-	c.lastSeq = seq
-	c.mu.Unlock()
-
-	slog.Debug("enter deal topic", "topic", topic)
-
-	var batch *EventBatch
-	switch string(topic) {
-	case "mooncake":
-		batch, err = DecodeMooncakeEventBatch(payload)
-	default:
-		batch, err = DecodeVllmEventBatch(payload)
-	}
+	batch, err := decodeBatch(source, payload)
 	if err != nil {
 		return fmt.Errorf("decode failed: %w", err)
 	}
-
 	for _, event := range batch.Events {
-		// Inject Source Name
 		switch e := event.(type) {
 		case *BlockStoredEvent:
 			e.PodName = c.config.CachePoolKey
 		case *BlockRemovedEvent:
 			e.PodName = c.config.CachePoolKey
 		}
-
 		if err := c.eventHandler.HandleEvent(event, batch.DataParallelRank); err != nil {
 			slog.Error("Handler error", "service", c.config.CachePoolKey, "error", err)
 		}
 	}
 
-	slog.Debug("Processed batch", "service", c.config.CachePoolKey, "seq", seq, "topic", string(topic))
+	c.mu.Lock()
+	if seq > c.lastSeq {
+		c.lastSeq = seq
+	}
+	c.mu.Unlock()
+	slog.Debug("Processed batch", "service", c.config.CachePoolKey, "seq", seq, "source", source)
 	return nil
+}
 
+func decodeBatch(source string, payload []byte) (*EventBatch, error) {
+	switch source {
+	case SourceMooncake:
+		return DecodeMooncakeEventBatch(payload)
+	case SourceSGLang:
+		return DecodeSGLangEventBatch(payload)
+	default:
+		return DecodeVllmEventBatch(payload)
+	}
 }
 
 func (c *ZMQClient) requestReplay(fromSeq int64) error {
@@ -303,25 +321,42 @@ func (c *ZMQClient) requestReplay(fromSeq int64) error {
 
 	req := make([]byte, 8)
 	binary.BigEndian.PutUint64(req, uint64(fromSeq))
-
-	if _, err := socket.SendBytes(req, 0); err != nil {
+	if _, err := socket.SendMessage([]byte{}, req); err != nil {
 		return fmt.Errorf("failed to send replay request: %w", err)
 	}
-
-	// Ideally, we should wait for an ACK here if the protocol supports it
-	// For simplicity in static client, we fire and forget the request,
-	// assuming the server will send the replayed events via the SUB channel (or DEALER response)
-	// Original code read response from DEALER, let's keep that.
-
 	_ = socket.SetRcvtimeo(c.config.ReplayTimeout)
-
-	resp, err := socket.RecvBytes(0)
-	if err != nil {
-		return fmt.Errorf("failed to receive replay response: %w", err)
+	if c.config.Source != SourceSGLang {
+		resp, err := socket.RecvBytes(0)
+		if err != nil {
+			return fmt.Errorf("failed to receive replay response: %w", err)
+		}
+		slog.Info("Replay requested", "service", c.config.CachePoolKey, "from", fromSeq, "resp_len", len(resp))
+		return nil
 	}
 
-	slog.Info("Replay requested", "service", c.config.CachePoolKey, "from", fromSeq, "resp_len", len(resp))
-	return nil
+	for {
+		frames, err := socket.RecvMessageBytes(0)
+		if err != nil {
+			return fmt.Errorf("failed to receive SGLang replay response: %w", err)
+		}
+		// libzmq versions differ in whether the ROUTER's empty delimiter is
+		// surfaced to a DEALER receiver. Accept both [seq, payload] and
+		// [empty, seq, payload] while keeping the SGLang wire contract strict.
+		if len(frames) == 3 && len(frames[0]) == 0 {
+			frames = frames[1:]
+		}
+		if len(frames) != 2 || len(frames[0]) != 8 {
+			return fmt.Errorf("invalid SGLang replay frame: %d parts", len(frames))
+		}
+		seq := int64(binary.BigEndian.Uint64(frames[0]))
+		if seq == -1 {
+			slog.Info("SGLang replay completed", "service", c.config.CachePoolKey, "from", fromSeq)
+			return nil
+		}
+		if err := c.processPayload(seq, frames[1], SourceSGLang); err != nil {
+			return fmt.Errorf("process SGLang replay sequence %d: %w", seq, err)
+		}
+	}
 }
 
 func (c *ZMQClient) cleanupSockets() {

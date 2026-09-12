@@ -97,6 +97,7 @@ func (e *BlockUpdateEvent) GetTimestamp() time.Time {
 const (
 	SourceMooncake string = "mooncake"
 	SourceVLLM     string = "vllm"
+	SourceSGLang   string = "sglang"
 )
 
 type EventBatch struct {

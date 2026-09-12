@@ -187,10 +187,18 @@ func (m *EventManager) subscribeToService(svc common.ServiceConfig) (bool, error
 	}
 
 	// Configure ZMQ Client
+	source := zmq.SourceVLLM
+	switch svc.Type {
+	case common.ServiceTypeMooncake:
+		source = zmq.SourceMooncake
+	case common.ServiceTypeSGLang:
+		source = zmq.SourceSGLang
+	}
 	zmqConfig := &zmq.ZMQClientConfig{
 		CachePoolKey:   svcKey,
 		Endpoint:       svc.Endpoint,
 		ReplayEndpoint: replayEndpoint,
+		Source:         source,
 		ModelName:      svc.ModelName,
 		PollTimeout:    100 * time.Millisecond,
 		ReplayTimeout:  5 * time.Second,
